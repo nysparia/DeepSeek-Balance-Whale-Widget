@@ -65,8 +65,16 @@ function extractFn(src, name) {
 }
 
 // 拼一个只含账本保留策略相关函数的沙箱。fs 可注入（用来模拟归档写盘失败）。
+// v8xx：readUsageArchive / pruneLedgerUsage 现在走 ledgerIo（temp+rename 与读重试），
+//   所以沙箱里要一并提供 ledgerIo 与它的两个常量（从源码抽，不另写一份）。
 function buildHarness(src, opts = {}) {
+  const consts = [...src.matchAll(/const (LEDGER_RETRY_WAIT_MS|LEDGER_RETRY_LIMIT) = (\d+)/g)]
+    .map((m) => `const ${m[1]} = ${m[2]};`)
+    .join('\n')
   const code = [
+    consts,
+    extractFn(src, 'ledgerIo'),
+    extractFn(src, 'ledgerBackupCorrupt'),
     extractFn(src, 'usageArchivePath'),
     extractFn(src, 'readUsageArchive'),
     extractFn(src, 'pruneLedgerUsage'),
@@ -253,8 +261,11 @@ console.log('\n=== 4. 归档写盘失败：返回 false 且一行都不删 ===')
   const { dir, candidates } = tmpHome('fail')
   const failingFs = {
     accessSync: () => {},
+    existsSync: () => false,
     readFileSync: () => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }) },
     writeFileSync: () => { throw Object.assign(new Error('EACCES'), { code: 'EACCES' }) },
+    renameSync: () => { throw Object.assign(new Error('EACCES'), { code: 'EACCES' }) },
+    unlinkSync: () => {},
   }
   const h = buildHarness(SRC, { home: dir, candidates, fs: failingFs })
   const led = makeLedger(400)
