@@ -145,6 +145,22 @@ function dshwvAudioWarn(url, err) {
   dshwvAudioWarned[url] = 1
   try { console.warn('[小鲸鱼] 音频加载/解码失败：' + url + ' → ' + msg) } catch (e) {}
 }
+// 删片段后必须把该片段的解码缓存一起清掉：dshwvAudioDecoded 只在解码成功时写入、只在解码失败时删除，
+// 删片段本身不碰它 —— 而 startSound 起播优先读缓存（同步路径），于是"已改为留空"的槽位在切组/刷新前
+// 仍会放出被删的音频。片段 URL 的唯一构造方式是 /dsh-whale/audio-fragment?id=<encodeURIComponent(片段id)>
+// （见 soundSlotUrls / playTaskEndSound），这里按**完整 URL** 精确匹配，不做裸前缀匹配 ——
+// 否则删 audio_abc 会连带清掉 audio_abcd 的缓存。
+function dshwvAudioCacheDropFragment(id) {
+  try {
+    var fid = String(id || '')
+    if (!fid) return
+    var base = '/dsh-whale/audio-fragment?id=' + encodeURIComponent(fid)
+    var hit = function (url) { return url === base || url.indexOf(base + '&') === 0 }
+    ;[dshwvAudioDecoded, dshwvAudioBuffers].forEach(function (m) {
+      for (var k in m) { if (Object.prototype.hasOwnProperty.call(m, k) && hit(k)) delete m[k] }
+    })
+  } catch (err) {}
+}
 function nowMs() { try { return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now() } catch (err) { return Date.now() } }
 function dshwvAudioBuffer(url) {
   if (!url) return Promise.reject(new Error('empty url'))
@@ -1650,7 +1666,10 @@ taskEndSel.addEventListener('change', function () {
 // （提问/授权 = events.<kind>.soundOn，任务结束音 = taskEnd.on），一个开关就够了，不再有语义重叠。
 // 连带效应（正是我们要的）：空/失效的 sel 不再被「静音」项接住，于是重新走到下面的兜底分支
 // （任务结束音挑默认音并**写回 usageSet**），下拉里再也不会出现空值。
-function fillSoundSelect(selectEl, currentSel) {
+// v8xx：`frag:<id>` 的 id 已不在 audioFragments 里（片段被删）时**置空（静音）**，
+//   不改写成第一个 frag 候选（静默换成别的音效），也不追加「（暂未加载）」幽灵项。
+//   whereLabel = 这个下拉代表的位置（进提示用），由调用方给。
+function fillSoundSelect(selectEl, currentSel, whereLabel) {
   if (!selectEl) return false
   var isTaskEnd = selectEl === taskEndSel
   // 期望值优先取“持久化设置”,避免启动时被上一轮的临时默认值带偏
@@ -1722,18 +1741,32 @@ function fillSoundSelect(selectEl, currentSel) {
       selectEl.appendChild(soundOpt(c.v, c.lab))
     } else add(c.v, c.lab)
   })
-  var fragN = 0
-  for (var fi = 0; fi < selectEl.options.length; fi++) if (String(selectEl.options[fi].value).indexOf('frag:') === 0) fragN++
   var found = false
   for (var i = 0; i < selectEl.options.length; i++) if (selectEl.options[i].value === cur) { selectEl.value = cur; found = true; break }
-  if (!found) {
+  // 片段列表**已就绪**、但 `frag:<id>` 的 id 不在列表里 = 该片段已被删除。
+  // 客户端把片段存成 `frag:<id>`（任务结束音/提问/授权），不在 audio.json 里，后端删片段碰不到它。
+  // 处理：置空（静音）—— 不改写成第一个 frag 候选（静默换成别的音效），也不留「（暂未加载）」幽灵项。
+  // 列表还没到（audioFragmentsLoaded=false）时一律不动，否则启动瞬间会把用户的选择清掉。
+  var staleFrag = ''
+  if (!found && cur.indexOf('frag:') === 0 && audioFragmentsLoaded) {
+    var curFragId = cur.slice(5)
+    var curFragExists = false
+    for (var ci = 0; ci < frags.length; ci++) if (frags[ci] && frags[ci].id === curFragId) { curFragExists = true; break }
+    if (!curFragExists) staleFrag = curFragId
+  }
+  if (staleFrag) {
+    // 只清 DOM，**不**写回空串：任务结束音的空 sel 会被下面的兜底分支改写成默认音，
+    // 那又变成"静默换了音效"。持久化值保持原样，下次 fill 仍走这里（提示已按 id+位置节流）。
+    selectEl.value = ''
+    audioFragStaleNotice(staleFrag, whereLabel || (isTaskEnd ? '任务结束音' : '提示音效'))
+  } else if (!found) {
     if (isTaskEnd) {
       // 期望值是自导入片段,但片段列表尚未就绪(启动时音频还在加载):
       // 先不落默认、不改写 usageSet,等片段就绪后的下一次 fill 再定,
       // 避免把用户的片段选择悄悄覆盖成「小黄鸭·按下」并随后续保存持久化。
       // 注意:这里把 value 置空是**流程需要**（fillTaskEndOptions 靠 `taskEndSel.value || prefSel`
       // 在下一轮重新取到真实值），与已删除的「静音」项无关 —— 置空后本次会显示为未选中，属预期。
-      if (cur && String(cur).indexOf('frag:') === 0 && fragN === 0) {
+      if (cur && String(cur).indexOf('frag:') === 0 && !audioFragmentsLoaded) {
         selectEl.value = ''
         if (taskEndDrop) taskEndDrop.refresh()
         return false
@@ -1786,7 +1819,7 @@ function fillSoundSelect(selectEl, currentSel) {
 function fillTaskEndOptions(pref) {
   var prefSel = (usageSet && usageSet.taskEnd && usageSet.taskEnd.sel) || (pref && pref.sel) || ''
   var cur = taskEndSel.value || prefSel || ''
-  fillSoundSelect(taskEndSel, cur)
+  fillSoundSelect(taskEndSel, cur, '任务结束音')
   if (pref && pref.sel) { for (var k = 0; k < taskEndSel.options.length; k++) if (taskEndSel.options[k].value === pref.sel) taskEndSel.value = pref.sel }
   if (taskEndDrop) taskEndDrop.refresh()
 }
@@ -3609,7 +3642,7 @@ function openSoundSettingsPanel() {
     }))
     var teDrop = dshwCustSel(teSel, { scrollNames: true })
     try { teSel.__dshwDrop = teDrop } catch (err) {}
-    fillSoundSelect(teSel, bufTaskEndSel)
+    fillSoundSelect(teSel, bufTaskEndSel, '任务结束音')
     // 「静音」项删除后下拉不该留空：把兜底后的真实值回写缓冲（旧数据 sel 为空串时兜底成列表里的默认音）
     if (teSel.value) bufTaskEndSel = teSel.value
     // v778：②区「提示音量」—— 拖动即视为**用户显式设置**（volSet = true），此后该事件用自己的值；
@@ -3689,7 +3722,7 @@ function openSoundSettingsPanel() {
       }))
       var drop = dshwCustSel(sel, { scrollNames: true })
       try { sel.__dshwDrop = drop } catch (err) {}
-      fillSoundSelect(sel, cfg.sel)
+      fillSoundSelect(sel, cfg.sel, selLabel)
       // 同 ②：「静音」项删除后下拉不该留空，把兜底后的真实值写回缓冲
       if (sel.value) cfg.sel = sel.value
       // v859：提问/授权的音量上限 200%
@@ -3704,7 +3737,7 @@ function openSoundSettingsPanel() {
         { el: vs.input, label: rVol.firstChild },
       ])
       sndEntries.push({ kind: kind, summary: wEnt.summary, sel: sel })
-      waitUI[kind] = { on: onChk, sel: sel, drop: drop, vol: vs, bub: bub, sound: soundChk }
+      waitUI[kind] = { on: onChk, sel: sel, drop: drop, vol: vs, bub: bub, sound: soundChk, label: selLabel }
     }
     buildWait('question', '提问提示', '提问提示音效')
     buildWait('approval', '授权提示', '授权提示音')
@@ -4035,7 +4068,7 @@ function openSoundSettingsPanel() {
           tcVol.input.value = String(sndBuf.turnCost.vol)
           tcVol.pct.textContent = Math.round(sndBuf.turnCost.vol * 100) + '%'
         } catch (err) {}
-        fillSoundSelect(teSel, bufTaskEndSel)
+        fillSoundSelect(teSel, bufTaskEndSel, '任务结束音')
         ;['question', 'approval'].forEach(function (kind) {
           var u = waitUI[kind]
           var cfg = sndBuf[kind]
@@ -4048,7 +4081,7 @@ function openSoundSettingsPanel() {
           try { u.bub.checked = cfg.bubbleOn !== false } catch (err) {}
           // v762：③④ 音效行的 [✓] 复位（DEF 里 soundOn: true）
           try { if (u.sound) u.sound.checked = cfg.soundOn !== false } catch (err) {}
-          fillSoundSelect(u.sel, cfg.sel)
+          fillSoundSelect(u.sel, cfg.sel, u.label)
         })
         // v765：入口行摘要也要跟着「恢复默认」刷新
         refreshSummaries()
@@ -6587,21 +6620,57 @@ function resDelAudioGroup(id) {
 // 后端 delete-fragment 会把引用被删片段的 press/release 置空（=该事件静音），
 // 不提示的话用户只会发现音效「变了」，不知道是删片段导致的。
 // 组名是用户输入，进 toast 前按 configSaveFailNotice 的同一套规则转义。
-function audioFragDeleteNotice(fragName, affected) {
+function audioFragNoticeEsc(s) {
+  return String(s == null ? '' : s).slice(0, 40)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+// clientRefs = 客户端 `frag:<id>` 引用被置空的位置名（任务结束音/提问/授权，见 audioFragClientRefs）。
+// 这些引用不在 audio.json 里，后端删片段碰不到，所以由前端在删除回调里一并报出来。
+function audioFragDeleteNotice(fragName, affected, clientRefs) {
   try {
-    if (!Array.isArray(affected) || !affected.length) return
-    var esc = function (s) {
-      return String(s == null ? '' : s).slice(0, 40)
-        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-    }
+    var aff = Array.isArray(affected) ? affected : []
+    var refs = Array.isArray(clientRefs) ? clientRefs : []
+    if (!aff.length && !refs.length) return
+    var esc = audioFragNoticeEsc
     var parts = []
-    for (var i = 0; i < affected.length && i < 4; i++) {
-      var a = affected[i] || {}
+    for (var i = 0; i < aff.length && i < 4; i++) {
+      var a = aff[i] || {}
       parts.push(esc(a.name || a.id || '未命名') + '（' + (a.slot === 'release' ? '松开' : '按下') + '）')
     }
-    var more = affected.length > 4 ? ' 等 ' + affected.length + ' 处' : ''
-    dshwvToast('已删除音频「' + esc(fragName) + '」；' + affected.length + ' 个音效组槽位已改为留空（不发声）：' +
-      parts.join('、') + more, 'ok', 5200)
+    var more = aff.length > 4 ? ' 等 ' + aff.length + ' 处' : ''
+    var msg = '已删除音频「' + esc(fragName) + '」；'
+    if (aff.length) msg += aff.length + ' 个音效组槽位已改为留空（不发声）：' + parts.join('、') + more
+    if (refs.length) msg += (aff.length ? '；' : '') + refs.join('、') + ' 已改为留空（不发声）'
+    dshwvToast(msg, 'ok', 5200)
+  } catch (err) {}
+}
+// 客户端把片段存成 `frag:<id>`（任务结束音 / 提问 / 授权），不在 audio.json 里 ——
+// 后端删片段碰不到这些引用。这里列出当前有哪些位置引用了该片段（进删除提示用）。
+function audioFragClientRefs(id) {
+  var out = []
+  try {
+    if (!id) return out
+    var v = 'frag:' + String(id)
+    if (usageSet && usageSet.taskEnd && usageSet.taskEnd.sel === v) out.push('任务结束音')
+    if (soundEventCfg('question').sel === v) out.push('提问提示音效')
+    if (soundEventCfg('approval').sel === v) out.push('授权提示音效')
+  } catch (err) {}
+  return out
+}
+// fillSoundSelect 发现失效的 `frag:<id>` 引用时置空（静音），并通过这里（与 audioFragDeleteNotice
+// 同一条提示通道）告诉用户哪个位置被置空。同一「片段 id + 位置」只提示一次：
+// 面板每次打开都会重新 fill，不节流会变成反复弹 toast。
+var audioFragStaleNotified = {}
+function audioFragStaleNotice(fragId, whereLabel) {
+  try {
+    var id = String(fragId || '')
+    if (!id) return
+    var where = String(whereLabel || '提示音效')
+    var key = id + '|' + where
+    if (audioFragStaleNotified[key]) return
+    audioFragStaleNotified[key] = 1
+    dshwvToast('音频片段已不存在（' + audioFragNoticeEsc(id) + '）；「' + audioFragNoticeEsc(where) +
+      '」已改为留空（不发声），请重新选择', 'ok', 5200)
   } catch (err) {}
 }
 function resDelAudioFrag(id) {
@@ -6619,11 +6688,16 @@ function resDelAudioFrag(id) {
         .then(function (d) {
           if (d && d.ok && Array.isArray(d.fragments)) {
             audioFragments = d.fragments
+            audioFragmentsLoaded = true
             if (Array.isArray(d.groups)) audioGroups = d.groups
+            // 组数据已更新（引用该片段的槽位被后端置空）→ 重建按压/松开音频元素，留空槽置 null；
+            // 同时清掉该片段的解码缓存，否则 startSound 仍会命中缓存、继续放被删的音频。
+            dshwvAudioCacheDropFragment(id)
+            applySoundSet()
             renderAudioGroupPanel()
             refreshTaskEndAfterAudio()
             openResManager()
-            audioFragDeleteNotice(fragName, d.affectedGroups)
+            audioFragDeleteNotice(fragName, d.affectedGroups, audioFragClientRefs(id))
           }
         })
         .catch(function () {})
@@ -6686,8 +6760,8 @@ function resRenderData(wrap, roles, bubbleImgs, audio) {
       anyAu = true
       var preset = !!g.preset
       var tag = resMkTag(preset ? '预设组' : '自定义组', preset)
-      var meta = ''
-      if (!preset && g.press && g.release) meta = '按压:' + g.press + ' 松开:' + g.release
+      // 摘要用片段名（不是原始 id）；空槽显示"留空"，两槽都留空时也照常显示
+      var meta = audioGroupSlotMeta(g)
       // 音效组不提供播放(按整组点按发声,需与点按动作绑定),只展示/删除
       auEnt.body.appendChild(resIconRow(preset ? '🎧' : '🎵', g.name || g.id, meta, [tag, resMkDel('删除', preset, function () { resDelAudioGroup(g.id) })]))
     })
@@ -20590,6 +20664,10 @@ function hideCropModal() {
 var AUDIO_URL = '/dsh-whale/audio.json'
 var audioGroups = [] // [{id,name,press,release,preset,pinned}]
 var audioFragments = [] // [{id,name,preset}]
+// 片段列表是否**已经从服务端拿到过**。fillSoundSelect 靠它区分两种"找不到 frag:<id>"：
+// 列表还没到（启动时 audio.json 在飞）→ 一律不动，等下一次 fill；列表已到 → 该片段确实被删了。
+// 不能用 audioFragments.length 代替：用户把片段全删光时列表也是空的。
+var audioFragmentsLoaded = false
 var audioGroupPanelOpen = false
 function loadAudio() {
   try {
@@ -20599,6 +20677,7 @@ function loadAudio() {
         if (!d || !d.ok) return
         if (Array.isArray(d.groups)) audioGroups = d.groups
         if (Array.isArray(d.fragments)) audioFragments = d.fragments
+        audioFragmentsLoaded = true
         // 若当前 soundSet 是已删除的自定义组，回退预设
         var exists = false
         for (var i = 0; i < audioGroups.length; i++) if (audioGroups[i].id === soundSet) { exists = true; break }
@@ -20749,6 +20828,12 @@ var audioEditReleaseVal = 'ya2'
 function audioSlotName(id) {
   for (var i = 0; i < audioFragments.length; i++) if (audioFragments[i].id === id) return audioFragments[i].name
   return id
+}
+// 资源窗口里音效组的槽位摘要：显示**片段名**而不是原始 id；空槽（=该事件静音）显示"留空"。
+// 两槽都留空时也必须显示（否则整段摘要消失，看不出哪个槽静音）。预设组不显示摘要。
+function audioGroupSlotMeta(g) {
+  if (!g || g.preset) return ''
+  return '按压:' + (g.press ? audioSlotName(g.press) : '留空') + ' 松开:' + (g.release ? audioSlotName(g.release) : '留空')
 }
 // 槽位按钮文案:空值=留空(该事件不发声),灰字提示;非空显示片段名
 function audioSlotBtnText(btn, id) {
@@ -21022,6 +21107,10 @@ function saveAudioGroup() {
             try { applySoundSet() } catch (err) {}
           }
           hideAudioEditor()
+        } else if (d && d.ok === false) {
+          // 后端拒绝保存（例如引用的片段已被删除 → 400）：必须让用户看见，
+          // 否则点「保存」像没反应。错误串来自服务端，进 toast 前转义。
+          dshwvToast('⚠ 保存音效组失败：' + audioFragNoticeEsc(d.error || '未知错误'), 'err', 6000)
         }
       })
       .catch(function () {})
@@ -21508,6 +21597,7 @@ function uploadAudioFragment(dataUrl, name, cb) {
       .then(function (d) {
         if (d && d.ok && Array.isArray(d.fragments)) {
           audioFragments = d.fragments
+          audioFragmentsLoaded = true
           lastUploadedFragmentId = d.id || null
           refreshTaskEndAfterAudio()
           if (cb) cb(true)
@@ -21517,6 +21607,15 @@ function uploadAudioFragment(dataUrl, name, cb) {
       })
       .catch(function () { if (cb) cb(false) })
   } catch (err) { if (cb) cb(false) }
+}
+// 删片段后清掉**草稿**里对它的引用：后端 delete-fragment 会把引用它的 press/release 两个槽都置空，
+// 前端草稿必须同样按 id 检查两个槽 —— 只清"被删的那个槽"会留下另一个槽的失效引用，
+// 保存时被后端强转成 duck 预设（用户点保存后松开音变成小黄鸭）。
+// 置空 = 留空·不发声；不能回退成 ya1/ya2 —— 那是静默替换成预设鸭叫，用户会以为还是自己的音效。
+function audioEditDropFragmentDraft(id) {
+  if (!id) return
+  if (audioEditPressVal === id) { audioEditPressVal = ''; audioSlotBtnText(audioEditPressBtn, '') }
+  if (audioEditReleaseVal === id) { audioEditReleaseVal = ''; audioSlotBtnText(audioEditReleaseBtn, '') }
 }
 // 片段面板里删除自定义片段（预设不可删）
 function audioDeleteFragmentInSlot(slot, id) {
@@ -21535,17 +21634,20 @@ function audioDeleteFragmentInSlot(slot, id) {
         .then(function (d) {
           if (d && d.ok && Array.isArray(d.fragments)) {
             audioFragments = d.fragments
+            audioFragmentsLoaded = true
             if (Array.isArray(d.groups)) audioGroups = d.groups
-            // 若当前槽位引用被删：置空（=留空·不发声），与后端把已保存组的槽位置空保持一致。
-            // 不能回退成 ya1/ya2 —— 那是静默替换成预设鸭叫，用户会以为还是自己的音效。
-            if (slot === 'press' && audioEditPressVal === id) { audioEditPressVal = ''; audioSlotBtnText(audioEditPressBtn, '') }
-            if (slot === 'release' && audioEditReleaseVal === id) { audioEditReleaseVal = ''; audioSlotBtnText(audioEditReleaseBtn, '') }
+            // 草稿两个槽都按 id 检查（与后端一致）
+            audioEditDropFragmentDraft(id)
+            // 组数据已更新 → 重建按压/松开音频元素（留空槽置 null），并清掉该片段的解码缓存，
+            // 否则 startSound 仍会命中缓存、继续放被删的音频。
+            dshwvAudioCacheDropFragment(id)
+            applySoundSet()
             // 重建试听音频：引用片段被删后若仍指向旧 URL 会失效（404/无声）
             audioEditPreviewEnsure(true)
             renderAudioGroupPanel()
             if (activeSlotPanel) renderAudioSlotPanel(slot)
             refreshTaskEndAfterAudio()
-            audioFragDeleteNotice(f.name, d.affectedGroups)
+            audioFragDeleteNotice(f.name, d.affectedGroups, audioFragClientRefs(id))
           }
         })
         .catch(function () {})
