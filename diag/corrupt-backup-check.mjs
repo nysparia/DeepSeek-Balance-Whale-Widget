@@ -18,12 +18,19 @@ const extractFn = makeExtractor(SRC)
 
 const FN_NAMES = [
   'backupCorruptFile',
+  // v864：读侧改成 ledgerIo + readConfigText（读错误不再当"损坏"），写侧改成 writeConfigJson
+  'ledgerIo', 'readConfigText', 'writeConfigJson',
   'readRolesIndex', 'defaultRolesIndex',
   'readAudioIndex', 'defaultAudioIndex',
   'readBubbleImgIndex', 'defaultBubbleImgIndex',
   'loadBubbleConfig',
+  'writeRolesIndex', 'writeAudioIndex', 'writeBubbleImgIndex',
 ]
 const body = FN_NAMES.map(extractFn).join('\n\n')
+// ledgerIo 的两个常量（重试次数/等待）也从源码里取，避免测试里另写一份
+const LEDGER_CONSTS = [...SRC.matchAll(/const (LEDGER_RETRY_WAIT_MS|LEDGER_RETRY_LIMIT) = (\d+)/g)]
+  .map((m) => `const ${m[1]} = ${m[2]};`).join('\n')
+if (!LEDGER_CONSTS) throw new Error('LEDGER_RETRY_* not found')
 
 // 目录桩：把 pick*Dir 固定到测试目录；常量按仓库真实值给。
 function build(dirs, logs) {
@@ -32,8 +39,10 @@ function build(dirs, logs) {
 const pickRoleDir = () => DIRS.roles
 const pickAudioDir = () => DIRS.audio
 const pickBubbleImgDir = () => DIRS.imgs
+${LEDGER_CONSTS}
 ${body}
-return { backupCorruptFile, readRolesIndex, readAudioIndex, readBubbleImgIndex, loadBubbleConfig }
+return { backupCorruptFile, readRolesIndex, readAudioIndex, readBubbleImgIndex, loadBubbleConfig,
+  writeRolesIndex, writeAudioIndex, writeBubbleImgIndex }
 `)
   return factory(fs, path, { error: (...a) => logs.push(a.map(String).join(' ')), warn: () => {} },
     dirs, 'roles.json', 'audio.json', 'bubble-imgs.json', 'default', dirs.bubbleCandidates)

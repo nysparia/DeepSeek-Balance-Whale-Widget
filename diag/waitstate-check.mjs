@@ -51,6 +51,8 @@ const DECL_STATES = extractDecl(/^ {4}const waitStates = new Map\(\).*$/m)
 const DECL_MAX = extractDecl(/^ {4}const WAIT_STATE_MAX = \d+.*$/m)
 const DECL_ACTIVE = extractDecl(/^ {4}let waitActiveSid = ''.*$/m)
 const DECL_TOOL = extractDecl(/^ {4}const WAIT_QUESTION_TOOL = .*$/m)
+// v864：waitView / notePendingEvent 现在会读 subagentSessions（无挂起时不被子 agent 覆盖）
+const DECL_SUBAGENTS = extractDecl(/^ {4}const subagentSessions = new Set\(\).*$/m)
 
 const FN_NAMES = ['waitBucket', 'waitView', 'titleFromService', 'pickSessionName', 'eventCallId', 'notePendingEvent']
 const body = FN_NAMES.map(extractFn).join('\n\n')
@@ -74,11 +76,12 @@ ${DECL_STATES}
 ${DECL_MAX}
 ${DECL_ACTIVE}
 ${DECL_TOOL}
+${DECL_SUBAGENTS}
 ${body}
 ${HANDLER_SRC}
 ${DISPOSED_SRC}
 return {
-  notePendingEvent, waitView, waitBucket, waitStates,
+  notePendingEvent, waitView, waitBucket, waitStates, subagentSessions,
   getActiveSid: () => waitActiveSid,
   waitJsonHandler, disposedHandler,
 }
