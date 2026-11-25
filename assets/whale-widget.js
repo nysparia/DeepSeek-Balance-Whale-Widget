@@ -21979,6 +21979,12 @@ try { root.addEventListener('wheel', onWhaleWheel, { passive: false }) } catch (
 // 缓存**只用于光标路径**；点击/拖动/click 拦截仍现取现算，避免缓存过期导致"点不动"。
 var cursorRectCache = null
 var cursorRectTimer = 0
+// 过渡进行中不缓存：root 的 transform .3s / left-top .16s 比 260ms 兜底更长，失效后第一帧
+// pointermove 就会把"过渡中途"的矩形缓存下来（实测偏差可达盒宽的 25%），表现为鼠标已在鲸鱼
+// 身上但光标不变 grab、☰ 不出现。过渡期间一律现取现算，不写缓存。
+var cursorRectFrozen = false
+function cursorRectFreeze() { cursorRectFrozen = true; invalidateCursorRect() }
+function cursorRectThaw() { cursorRectFrozen = false; invalidateCursorRect() }
 function invalidateCursorRect() { cursorRectCache = null }
 // express() 之后 left/top 有 .16s 过渡，过渡期间矩形在动：立刻失效一次，
 // 再在过渡结束后（transitionend 或 260ms 兜底）失效一次，避免缓存停在过渡起点。
@@ -21991,6 +21997,9 @@ function invalidateCursorRectSoon() {
   }, 260)
 }
 function cursorImgRect() {
+  if (cursorRectFrozen) {
+    try { return img.getBoundingClientRect() } catch (err) { return null }
+  }
   if (cursorRectCache) return cursorRectCache
   try { cursorRectCache = img.getBoundingClientRect() } catch (err) { cursorRectCache = null }
   return cursorRectCache
@@ -22054,7 +22063,12 @@ document.addEventListener('pointermove', onDocPointerMoveCursor, true)
 try { window.addEventListener('resize', invalidateCursorRect, { passive: true }) } catch (err) {}
 try { window.addEventListener('scroll', invalidateCursorRect, { capture: true, passive: true }) } catch (err) {}
 try { img.addEventListener('load', invalidateCursorRect) } catch (err) {}
-try { root.addEventListener('transitionend', invalidateCursorRect) } catch (err) {}
+// 过渡开始/结束的冻结与解冻（transitionend 顺带失效，等价于原来的失效点）。
+// transitionrun 比 transitionstart 早（含 delay 阶段），两个都挂上，过渡一开始就停止缓存。
+try { root.addEventListener('transitionrun', cursorRectFreeze) } catch (err) {}
+try { root.addEventListener('transitionstart', cursorRectFreeze) } catch (err) {}
+try { root.addEventListener('transitionend', cursorRectThaw) } catch (err) {}
+try { root.addEventListener('transitioncancel', cursorRectThaw) } catch (err) {}
 // 启动即应用一次菜单按钮可见性：触屏上 ☰ 常显（issue #91 缺陷2）。
 // 配置读回来之后还会再应用一次，这里是配置请求失败时的兜底。
 try { applyMenuBtnHideUI() } catch (err) {}
@@ -22347,16 +22361,47 @@ function waitEventCfg(kind) {
 }
 // issue #342：in-flight 守卫。宿主响应慢于 1 秒时，旧实现每秒再发一个 —— 请求会堆叠，
 // 而且每个响应回来都要跑一遍渲染/去重逻辑。同一时刻只允许一个在飞。
+// 后台降频：document.hidden 时**不停**轮询，只把频率压到 10 秒一次。任务结束音 / 提问音 /
+// 授权音只由这两个 poll 触发（全文件没有 Notification API），用户把 DSH 切到后台等 agent
+// 跑完正是最需要提醒的场景，停掉就等于不提醒。前台仍是每秒一次。
+// 两个 poll 各记各的后台时间戳：共用一份的话，同一 tick 里先跑的那个会把后一个挡掉，
+// wait.json 在后台就永远不查了。
+var BG_POLL_MS = 10000
+var lastBgPollAt = 0
+var lastBgPollAtTurn = 0
+function pollBgAllowed(lastAt) {
+  if (!document.hidden) return true
+  return Date.now() - lastAt >= BG_POLL_MS
+}
+// in-flight 守卫的看门狗：fetch 挂住时 busy 会永久为 true（之后每个 tick 都被挡掉，
+// visibilitychange 也救不回来）。abort 之外再加一道时间兜底，防 abort 本身不生效的极端情况。
+var POLL_BUSY_MAX_MS = 15000
+// 5 秒超时：宿主卡住时不能让 in-flight 守卫永久为 true。老浏览器没有 AbortSignal.timeout
+// 就不传 signal（此时靠上面的 15 秒看门狗兜底）。
+function pollFetchOpts() {
+  var o = { cache: 'no-store' }
+  try {
+    if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
+      o.signal = AbortSignal.timeout(5000)
+    }
+  } catch (err) {}
+  return o
+}
 var pollWaitBusy = false
+var pollWaitBusyAt = 0
 function pollWaitState() {
-  if (pollWaitBusy) return
-  // 页面在后台不轮询：浏览器会把定时器节流到 1/分钟，但前台可见时是实打实的 2 req/s。
-  // 回到前台由 visibilitychange 立刻补一次（见文件末尾）。
-  if (document.hidden) return
+  if (pollWaitBusy) {
+    // 看门狗：busy 超过 15 秒说明那次请求已经挂死，无条件清零继续
+    if (Date.now() - pollWaitBusyAt < POLL_BUSY_MAX_MS) return
+    pollWaitBusy = false
+  }
+  if (!pollBgAllowed(lastBgPollAt)) return
+  if (document.hidden) lastBgPollAt = Date.now()
   pollWaitBusy = true
+  pollWaitBusyAt = Date.now()
   var done = function () { pollWaitBusy = false }
   try {
-    fetch(WAIT_URL, { cache: 'no-store' })
+    fetch(WAIT_URL, pollFetchOpts())
       .then(function (r) { return r.json() })
       .then(function (d) {
         if (!d || !d.ok) return
@@ -22404,13 +22449,20 @@ function pollWaitState() {
   } catch (err) { done() }
 }
 var pollLastTurnBusy = false
+var pollLastTurnBusyAt = 0
 function pollLastTurn() {
-  if (pollLastTurnBusy) return
-  if (document.hidden) return
+  if (pollLastTurnBusy) {
+    // 看门狗：同上，busy 超过 15 秒无条件清零
+    if (Date.now() - pollLastTurnBusyAt < POLL_BUSY_MAX_MS) return
+    pollLastTurnBusy = false
+  }
+  if (!pollBgAllowed(lastBgPollAtTurn)) return
+  if (document.hidden) lastBgPollAtTurn = Date.now()
   pollLastTurnBusy = true
+  pollLastTurnBusyAt = Date.now()
   var done = function () { pollLastTurnBusy = false }
   try {
-    fetch(LAST_TURN_URL, { cache: 'no-store' })
+    fetch(LAST_TURN_URL, pollFetchOpts())
       .then(function (r) { return r.json() })
       .then(function (d) {
         if (!d || !d.ok || typeof d.seq !== 'number') return
