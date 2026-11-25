@@ -8,7 +8,21 @@ import { execFileSync } from 'node:child_process'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const repo = path.join(here, '..')
-const SRC = execFileSync('git', ['show', 'HEAD:lib/index.js'], { cwd: repo, encoding: 'utf8' })
+// 基线必须沿 git 历史回溯找"仍含旧 waitState 声明"的那一版，不能用 HEAD ——
+// 修复提交之后 HEAD 就是新版，脚本会自己挂掉（本脚本 2026-11-25 踩过）。
+function findOldBaseline() {
+  const revs = execFileSync('git', ['rev-list', 'HEAD', '--', 'lib/index.js'], { cwd: repo, encoding: 'utf8' })
+    .trim().split('\n').filter(Boolean)
+  for (const rev of revs) {
+    const src = execFileSync('git', ['show', rev + ':lib/index.js'], { cwd: repo, encoding: 'utf8' })
+    // 判据用**代码行**：新版注释里也提到 waitState，用裸片段会误判。
+    if (/^ {4}const waitState = \{ pending: null, sessionName: "" \}$/m.test(src)) return { rev, src }
+  }
+  throw new Error('找不到修复前的 lib/index.js 基线（旧 waitState 声明）')
+}
+const baseline = findOldBaseline()
+const SRC = baseline.src
+console.log('旧版基线：' + baseline.rev.slice(0, 7))
 
 function braceBlock(at) {
   const open = SRC.indexOf('{', at)
