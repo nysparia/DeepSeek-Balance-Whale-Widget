@@ -6583,10 +6583,32 @@ function resDelAudioGroup(id) {
     } catch (err) {}
   })
 }
+// 删除片段后必须让用户看见「哪些组的槽位被改成留空」。
+// 后端 delete-fragment 会把引用被删片段的 press/release 置空（=该事件静音），
+// 不提示的话用户只会发现音效「变了」，不知道是删片段导致的。
+// 组名是用户输入，进 toast 前按 configSaveFailNotice 的同一套规则转义。
+function audioFragDeleteNotice(fragName, affected) {
+  try {
+    if (!Array.isArray(affected) || !affected.length) return
+    var esc = function (s) {
+      return String(s == null ? '' : s).slice(0, 40)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    }
+    var parts = []
+    for (var i = 0; i < affected.length && i < 4; i++) {
+      var a = affected[i] || {}
+      parts.push(esc(a.name || a.id || '未命名') + '（' + (a.slot === 'release' ? '松开' : '按下') + '）')
+    }
+    var more = affected.length > 4 ? ' 等 ' + affected.length + ' 处' : ''
+    dshwvToast('已删除音频「' + esc(fragName) + '」；' + affected.length + ' 个音效组槽位已改为留空（不发声）：' +
+      parts.join('、') + more, 'ok', 5200)
+  } catch (err) {}
+}
 function resDelAudioFrag(id) {
   var f = null
   for (var i = 0; i < (audioFragments || []).length; i++) if (audioFragments[i].id === id) { f = audioFragments[i]; break }
-  showConfirm('确定删除音频片段「' + (f && f.name ? f.name : id) + '」吗？\n引用该片段的音效组槽位会自动回退预设。', function () {
+  var fragName = f && f.name ? f.name : id
+  showConfirm('确定删除音频片段「' + fragName + '」吗？\n引用该片段的音效组槽位会改为留空（不发声）。', function () {
     try {
       fetch('/dsh-whale/audio.json', {
         method: 'POST',
@@ -6601,6 +6623,7 @@ function resDelAudioFrag(id) {
             renderAudioGroupPanel()
             refreshTaskEndAfterAudio()
             openResManager()
+            audioFragDeleteNotice(fragName, d.affectedGroups)
           }
         })
         .catch(function () {})
@@ -21513,14 +21536,16 @@ function audioDeleteFragmentInSlot(slot, id) {
           if (d && d.ok && Array.isArray(d.fragments)) {
             audioFragments = d.fragments
             if (Array.isArray(d.groups)) audioGroups = d.groups
-            // 若当前槽位引用被删，回退预设
-            if (slot === 'press' && audioEditPressVal === id) { audioEditPressVal = 'ya1'; audioSlotBtnText(audioEditPressBtn, 'ya1') }
-            if (slot === 'release' && audioEditReleaseVal === id) { audioEditReleaseVal = 'ya2'; audioSlotBtnText(audioEditReleaseBtn, 'ya2') }
+            // 若当前槽位引用被删：置空（=留空·不发声），与后端把已保存组的槽位置空保持一致。
+            // 不能回退成 ya1/ya2 —— 那是静默替换成预设鸭叫，用户会以为还是自己的音效。
+            if (slot === 'press' && audioEditPressVal === id) { audioEditPressVal = ''; audioSlotBtnText(audioEditPressBtn, '') }
+            if (slot === 'release' && audioEditReleaseVal === id) { audioEditReleaseVal = ''; audioSlotBtnText(audioEditReleaseBtn, '') }
             // 重建试听音频：引用片段被删后若仍指向旧 URL 会失效（404/无声）
             audioEditPreviewEnsure(true)
             renderAudioGroupPanel()
             if (activeSlotPanel) renderAudioSlotPanel(slot)
             refreshTaskEndAfterAudio()
+            audioFragDeleteNotice(f.name, d.affectedGroups)
           }
         })
         .catch(function () {})
