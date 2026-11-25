@@ -1,0 +1,49 @@
+diff --git a/lib/index.js b/lib/index.js
+index d1acaaa..8fe8d8d 100644
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -800,10 +800,18 @@ export default {
+         return null
+       } catch (err) { return 403 } // 校验器自身出错 → 拒绝（fail-closed）
+     }
++    // 宿主栅栏的两种形态：
++    //   · DSH <= 0.2.1：connection.requestRejection(req) -> number | undefined
++    //   · DSH >= 0.2.2-rc.2：connection.admit(req) -> { peer } | { rejection: 401|403|503 }
++    //     （0.2.2-rc.2 的迁移指南移除了 requestRejection，改用 admit）
++    // 只认前者会让新版宿主上这层恒为 null —— 401/503 被吞、trustedHosts 权威被误判 403。
+     function connectionFence() {
+       try {
+         const conn = ctx.get('connection') || ctx.connection
+-        return conn && typeof conn.requestRejection === 'function' ? conn : null
++        if (!conn) return null
++        if (typeof conn.requestRejection === 'function') return conn
++        if (typeof conn.admit === 'function') return conn
++        return null
+       } catch (err) { return null }
+     }
+     if (!connectionFence()) {
+@@ -860,7 +868,23 @@ export default {
+       if (!conn) return false // 已通过自校验；此刻没有宿主栅栏可委托（加载时已 warn）
+       let code
+       try {
+-        code = conn.requestRejection(req)
++        if (typeof conn.requestRejection === 'function') {
++          code = conn.requestRejection(req)
++        } else {
++          // admit 交回 Peer：{ peer } 放行，{ rejection } 原样透出。
++          // 非 owner 的 Peer 一律 403 —— 写配置等于决定"把凭据发往哪里"，
++          // 只有本机所有者能做（与 writeRejection 的意图一致）。
++          const admission = conn.admit({ headers: req.headers, method: req.method, url: req.url })
++          if (admission && admission.rejection) {
++            code = admission.rejection
++          } else if (admission && admission.peer) {
++            const kind = admission.peer.principal && admission.peer.principal.kind
++            code = kind !== undefined && kind !== 'owner' ? 403 : undefined
++          } else {
++            // admit 返回 undefined：这道实现不认得这次请求，不能当放行
++            code = 403
++          }
++        }
+       } catch (err) {
+         // 旧实现这里是 `return false`：栅栏自己抛异常被当成"没被拒"而静默放行（#136 的第二条路径）
+         if (!rejected.warned) {
