@@ -4,51 +4,24 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { execFileSync } from 'node:child_process'
+import { findOldBaseline } from './_baseline.mjs'
+import { makeExtractor } from './_extract.mjs'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const repo = path.join(here, '..')
 // 基线必须沿 git 历史回溯找"仍含旧 waitState 声明"的那一版，不能用 HEAD ——
 // 修复提交之后 HEAD 就是新版，脚本会自己挂掉（本脚本 2026-11-25 踩过）。
-function findOldBaseline() {
-  const revs = execFileSync('git', ['rev-list', 'HEAD', '--', 'lib/index.js'], { cwd: repo, encoding: 'utf8' })
-    .trim().split('\n').filter(Boolean)
-  for (const rev of revs) {
-    const src = execFileSync('git', ['show', rev + ':lib/index.js'], { cwd: repo, encoding: 'utf8' })
-    // 判据用**代码行**：新版注释里也提到 waitState，用裸片段会误判。
-    if (/^ {4}const waitState = \{ pending: null, sessionName: "" \}$/m.test(src)) return { rev, src }
-  }
-  throw new Error('找不到修复前的 lib/index.js 基线（旧 waitState 声明）')
-}
-const baseline = findOldBaseline()
+// 判据用**代码行**：新版注释里也提到 waitState，用裸片段会误判。
+const baseline = findOldBaseline(
+  repo,
+  (src) => /^ {4}const waitState = \{ pending: null, sessionName: "" \}$/m.test(src),
+  '仍含旧 waitState 声明的版本',
+)
 const SRC = baseline.src
 console.log('旧版基线：' + baseline.rev.slice(0, 7))
 
-function braceBlock(at) {
-  const open = SRC.indexOf('{', at)
-  let depth = 0
-  let inStr = null
-  let inLine = false
-  let inBlock = false
-  for (let i = open; i < SRC.length; i++) {
-    const c = SRC[i]
-    const n = SRC[i + 1]
-    if (inLine) { if (c === '\n') inLine = false; continue }
-    if (inBlock) { if (c === '*' && n === '/') { inBlock = false; i++ } continue }
-    if (inStr) { if (c === '\\') { i++; continue } if (c === inStr) inStr = null; continue }
-    if (c === '/' && n === '/') { inLine = true; i++; continue }
-    if (c === '/' && n === '*') { inBlock = true; i++; continue }
-    if (c === '"' || c === "'" || c === '`') { inStr = c; continue }
-    if (c === '{') depth++
-    else if (c === '}') { depth--; if (depth === 0) return SRC.slice(open, i + 1) }
-  }
-  throw new Error('unbalanced')
-}
-function extractFn(name) {
-  const at = SRC.indexOf('function ' + name + '(')
-  if (at < 0) throw new Error('not found: ' + name)
-  return SRC.slice(at, SRC.indexOf('{', at) + braceBlock(at).length)
-}
+// 按函数名抽取源码：抽取器在 diag/_extract.mjs（共用；`async function` 不会被截掉 async）。
+const extractFn = makeExtractor(SRC)
 
 const DECL_STATE = SRC.match(/^ {4}const waitState = .*$/m)[0]
 const DECL_TOOL = SRC.match(/^ {4}const WAIT_QUESTION_TOOL = .*$/m)[0]

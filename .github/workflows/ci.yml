@@ -26,7 +26,12 @@ jobs:
   audit:
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth: 0 拉全量历史：diag/ 下三个脚本要从 lib/index.js 的历史里找"修复前"的基线
+      # （ledger-books-prune / ledger-updatecheck / waitstate-before）。默认的 depth-1 克隆里
+      # 那些提交对象根本不存在，脚本会直接失败（实测 depth-1 clone：这 3 个脚本 exit=1）。
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -51,7 +56,7 @@ jobs:
       # 四项都是"错了不会报错、只会静默失效"的事：
       #   ① 检查所有后台接口必须走统一安全入口
       #      每条 /dsh-whale/* 路由都要经过 registerRoute() 的 requestRejection 包装。
-      #      让什么通过：全仓只有 1 处裸 ctx.webServer.register，且它必须在那个包装器函数体内。
+      #      让什么通过：全仓只有 1 处裸 .register(（不限前缀，别名也算），且它必须在那个包装器函数体内。
       #      为什么：多出一处裸注册 = 绕过安全栅栏（安全修复 S1 的凭据外带、issue #136 的 fail-open 都是这类）。
       #   ② 检查后端提供了所有前端调用的接口
       #      前端 fetch 的每条 /dsh-whale/* 路径，都要能在后端注册表里命中（精确命中，或落在某个已注册路径前缀下）。
@@ -70,6 +75,19 @@ jobs:
       # 防的是"门禁腐烂"：脚本哪天被改得只会放行、或误判到把合法代码判死，这里会红。
       - name: Audit self-test
         run: node tools/ci-audit-selftest.mjs
+
+      # 回归脚本（diag/*.mjs）：每个脚本都从 lib/index.js 里**按源码位置抽取真实代码**再断言，
+      # 覆盖的是"改了不会报错、只会静默失效"的行为（信任栅栏、账本裁剪、waitState 串会话…）。
+      # 以前它们只在本机手工跑 —— 于是 fence-ab / fence-trusted 长期零断言也没人发现。
+      # 约定：diag/ 下每个 *.mjs 都是可执行脚本，退出码非 0 即失败；`_` 开头的是共享模块，跳过。
+      - name: Regression diags (diag/*.mjs)
+        run: |
+          for f in diag/*.mjs; do
+            case "$(basename "$f")" in _*) continue ;; esac
+            echo "::group::$f"
+            node "$f"
+            echo "::endgroup::"
+          done
 
       # 「发布副本不得含开发机绝对路径」：宿主发布前必须跑一次
       # `_strip-dev-paths.mjs --apply`（它会删掉 RUA_GIF_CANDIDATES / IMAGE_CANDIDATES 等

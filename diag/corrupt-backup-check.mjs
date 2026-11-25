@@ -7,37 +7,14 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { makeExtractor } from './_extract.mjs'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const SRC = fs.readFileSync(path.join(here, '..', 'lib', 'index.js'), 'utf8')
 
 // —— 按函数名抽取源码（从 `function NAME(` 到配对的花括号）——
-function extractFn(name) {
-  const at = SRC.indexOf('function ' + name + '(')
-  if (at < 0) throw new Error('function not found: ' + name)
-  const open = SRC.indexOf('{', at)
-  let depth = 0
-  let inStr = null
-  let inLine = false
-  let inBlock = false
-  for (let i = open; i < SRC.length; i++) {
-    const c = SRC[i]
-    const n = SRC[i + 1]
-    if (inLine) { if (c === '\n') inLine = false; continue }
-    if (inBlock) { if (c === '*' && n === '/') { inBlock = false; i++ } continue }
-    if (inStr) {
-      if (c === '\\') { i++; continue }
-      if (c === inStr) inStr = null
-      continue
-    }
-    if (c === '/' && n === '/') { inLine = true; i++; continue }
-    if (c === '/' && n === '*') { inBlock = true; i++; continue }
-    if (c === '"' || c === "'" || c === '`') { inStr = c; continue }
-    if (c === '{') depth++
-    else if (c === '}') { depth--; if (depth === 0) return SRC.slice(at, i + 1) }
-  }
-  throw new Error('unbalanced braces in ' + name)
-}
+// 抽取器在 diag/_extract.mjs（共用；`async function` 不会被截掉 async）。
+const extractFn = makeExtractor(SRC)
 
 const FN_NAMES = [
   'backupCorruptFile',

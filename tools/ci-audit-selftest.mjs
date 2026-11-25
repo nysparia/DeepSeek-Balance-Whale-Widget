@@ -30,6 +30,7 @@ const WF = [
   '      - run: node tools/z-layer-audit.mjs assets/whale-widget.js',
   '      - run: node --check lib/index.js',
   '      - run: grep -n "TestBox" lib/index.js lib/accounting.mjs assets/whale-widget.js',
+  '      - run: for f in diag/*.mjs; do node "$f"; done',
   '',
 ].join('\n')
 
@@ -127,6 +128,38 @@ check('① 多出一处绕过 registerRoute 的裸注册 → 必红', () => {
   red(dir, '1', '绕过栅栏的裸注册')
 })
 
+// 只认 `ctx.webServer.register` 这一种拼写时，别名能静默绕过（实测：审计仍报"1 处"、5/5 全绿）。
+// 注意是**追加**一条路由，不是替换 —— 替换会同时改掉路由条数，那样红的原因就不是栅栏了。
+check('① 用别名裸注册（const _ws = ctx.webServer; _ws.register(...)）→ 必红', () => {
+  const dir = writeFixture('c1-alias', {
+    'lib/index.js': HOST
+      + "const _ws = ctx.webServer\n"
+      + "_ws.register({ kind: 'exact', path: '/dsh-whale/extra.json', handler: (q, s) => s.end() })\n",
+  })
+  red(dir, '1', '别名裸注册')
+})
+
+// 包装器窗口若用缩进锚点（`src.indexOf('\n    }', wrapper)`）取，缩进一变就返回 -1，
+// 检查会退化成"在函数定义之后即可" —— 这个样本专门钉住那种退化。
+check('① 裸注册在包装器函数体外（缩进不同，缩进锚点会漏判）→ 必红', () => {
+  const dir = writeFixture('c1-outside', {
+    'lib/index.js': [
+      'const WIDGET_FILE_CANDIDATES = [',
+      "  path.join(path.dirname(fileURLToPath(import.meta.url)), 'whale-widget.js'),",
+      "  path.join(PACKAGE_ROOT, 'assets', 'whale-widget.js'),",
+      ']',
+      'function registerRoute(route) {',
+      '  return route', // 包装器里没有 register
+      '}',
+      "registerRoute({ kind: 'exact', path: '/dsh-whale/balance.json', handler: (q, s) => s.end() })",
+      "registerRoute({ kind: 'exact', path: '/dsh-whale/widget.js', handler: (q, s) => s.end() })",
+      "ctx.webServer.register({ kind: 'exact', path: '/dsh-whale/extra.json', handler: (q, s) => s.end() })",
+      '',
+    ].join('\n'),
+  })
+  red(dir, '1', '裸注册在包装器外')
+})
+
 check('① README 声明的路由条数与实际不符 → 必红', () => {
   const dir = writeFixture('c1-count', { 'README.md': '全部 **9 个** `/dsh-whale/*` 路由都已接入信任栅栏。\n' })
   red(dir, '1', 'README 条数漂移')
@@ -205,6 +238,13 @@ check('④ publish.yml 被摘掉语法检查 → 必红', () => {
     '.github/workflows/publish.yml': WF.replace('      - run: node --check lib/index.js\n', ''),
   })
   red(dir, '4', '发布前门禁少一项')
+})
+
+check('④ publish.yml 被摘掉回归脚本（diag）→ 必红', () => {
+  const dir = writeFixture('c4-diag', {
+    '.github/workflows/publish.yml': WF.replace('      - run: for f in diag/*.mjs; do node "$f"; done\n', ''),
+  })
+  red(dir, '4', '发布前门禁少了 diag')
 })
 
 check('④ 两份 workflow 覆盖一致 → 必须绿', () => {
