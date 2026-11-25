@@ -185,11 +185,17 @@ function extractUpdateBlock(src, isNew) {
 }
 
 // 桩：registerRoute 收集 handler；httpsGetJson / npmCliVersion 计数并延迟返回。
-function buildUpdateHarness(src, isNew) {
+// v864：`UPDATE_CHECK_DEADLINE_MS` 在抽取段**之外**（lib/index.js 里它声明在
+//   `let updateCheckCache = null` 之前），所以这里作为注入点传进去 —— 探针可以用
+//   60ms 的截止时间验证"上游永不 settle"这条路径，不必真等 15 秒。
+const DEADLINE_MS = Number((SRC.match(/const UPDATE_CHECK_DEADLINE_MS = (\d+)/) || [])[1])
+if (!DEADLINE_MS) throw new Error('UPDATE_CHECK_DEADLINE_MS not found in lib/index.js')
+
+function buildUpdateHarness(src, isNew, deadlineMs) {
   const block = extractUpdateBlock(src, isNew)
   const factory = new Function(
     'registerRoute', 'disposers', 'UPDATE_SOURCES', 'httpsGetJson', 'npmCliVersion',
-    'BUILD_VERSION', 'BUILD_CHANNEL', 'JSON_HEADERS', 'console', '__routes',
+    'BUILD_VERSION', 'BUILD_CHANNEL', 'JSON_HEADERS', 'console', '__routes', 'UPDATE_CHECK_DEADLINE_MS',
     `
 ${block}
 return {
@@ -221,7 +227,8 @@ return {
     return '9.9.9'
   }
   const api = factory(registerRoute, disposers, UPDATE_SOURCES, httpsGetJson, npmCliVersion,
-    '0.4.2', 'stable', { 'content-type': 'application/json' }, console, __routes)
+    '0.4.2', 'stable', { 'content-type': 'application/json' }, console, __routes,
+    deadlineMs || DEADLINE_MS)
   return { api, stats }
 }
 
@@ -297,7 +304,7 @@ async function hammer(handler, n) {
   const __routes = []
   const factory = new Function(
     'registerRoute', 'disposers', 'UPDATE_SOURCES', 'httpsGetJson', 'npmCliVersion',
-    'BUILD_VERSION', 'BUILD_CHANNEL', 'JSON_HEADERS', 'console', '__routes',
+    'BUILD_VERSION', 'BUILD_CHANNEL', 'JSON_HEADERS', 'console', '__routes', 'UPDATE_CHECK_DEADLINE_MS',
     `
 ${block}
 return { handler: __routes[0], inFlight: () => updateCheckInFlight, cache: () => updateCheckCache }
@@ -308,7 +315,7 @@ return { handler: __routes[0], inFlight: () => updateCheckInFlight, cache: () =>
     [{ name: 'x', url: 'https://x' }, { name: 'y', cli: true }],
     async () => { throw new Error('超时') },
     async () => { throw new Error('超时') },
-    '0.4.2', 'stable', {}, console, __routes
+    '0.4.2', 'stable', {}, console, __routes, DEADLINE_MS
   )
   const resList = await hammer(api.handler, 4)
   const b = JSON.parse(resList[0].body)
