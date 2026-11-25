@@ -211,17 +211,26 @@ const run = (id, title, fn) => {
 run('1', '检查所有后台接口必须走统一安全入口', (problems, notes) => {
   const src = read(HOST_FILE)
 
-  // 裸 webServer.register 只允许 1 处：就在 registerRoute() 包装器内部
-  const bare = [...src.matchAll(/\bctx\.webServer\.register\s*\(/g)]
+  // 裸 register 只允许 1 处：就在 registerRoute() 包装器内部。
+  // 判据**不限前缀**：`const _ws = ctx.webServer; _ws.register(...)` 这类别名同样是裸注册
+  // （实测：只认 `ctx.webServer.register` 这一种拼写时，加一行别名后审计仍报"1 处"、5/5 全绿，
+  //  而那条路由零栅栏 —— rejected() 全仓只有 registerRoute 包装器里一个调用点）。
+  const bare = [...src.matchAll(/\.register\s*\(/g)]
+  const wrapper = src.indexOf('function registerRoute(')
+  // 包装器函数体用括号配对取。**不要**用缩进锚点（`src.indexOf('\n    }', wrapper)`）：
+  // 缩进一变窗口就漂，找不到时返回 -1 会让检查退化成"在函数定义之后即可"。
+  const wrapperOpen = wrapper < 0 ? -1 : src.indexOf('{', wrapper)
+  const wrapperBody = wrapperOpen < 0 ? null : balancedBlock(src, wrapperOpen)
   if (bare.length !== 1) {
-    problems.push('ctx.webServer.register 出现 ' + bare.length + ' 次（应为 1 次：只在 registerRoute() 包装器内部）'
+    problems.push('.register( 出现 ' + bare.length + ' 次（应为 1 次：只在 registerRoute() 包装器内部）'
       + ' —— 新增的裸注册会绕过 requestRejection 栅栏（安全修复 S1 / issue #136）')
+  } else if (wrapperBody === null) {
+    problems.push('找不到 registerRoute() 的函数体 —— 无法确认裸 register 在栅栏内（函数被改名/删掉了？）')
   } else {
     const at = bare[0].index
-    const wrapper = src.indexOf('function registerRoute(')
-    const wrapperEnd = src.indexOf('\n    }', wrapper)
-    if (wrapper < 0 || at < wrapper || (wrapperEnd > 0 && at > wrapperEnd)) {
-      problems.push('唯一的 ctx.webServer.register 不在 registerRoute() 函数体内 —— 栅栏被绕开了')
+    const end = wrapperOpen + wrapperBody.length - 1
+    if (at < wrapperOpen || at > end) {
+      problems.push('唯一的 .register( 不在 registerRoute() 函数体内 —— 栅栏被绕开了')
     }
   }
 
@@ -248,7 +257,8 @@ run('1', '检查所有后台接口必须走统一安全入口', (problems, notes
   if (claim && Number(claim[1]) !== uniq.length) {
     problems.push('README 声明 ' + claim[1] + ' 个 /dsh-whale/* 路由，实际注册 ' + uniq.length + ' 条 —— 对外文档与代码不一致')
   }
-  notes.push('注册路由 ' + uniq.length + ' 条；裸 register 1 处（在包装器内）；README 声明 '
+  notes.push('注册路由 ' + uniq.length + ' 条；.register( ' + bare.length + ' 处'
+    + (bare.length === 1 && wrapperBody ? '（在 registerRoute() 内）' : '') + '；README 声明 '
     + (claim ? claim[1] + ' 条 ✓' : '未找到条数声明'))
   run.hostRoutes = uniq
 })
@@ -447,6 +457,9 @@ run('4', '检查日常ci与发版ci流程是否一致', (problems, notes) => {
     { name: '图层审计', re: /z-layer-audit\.mjs/ },
     { name: '语法检查', re: /node\s+--check\s+lib\/index\.js/ },
     { name: '开发机路径扫描', re: /TestBox/ },
+    // diag/ 下的回归脚本（信任栅栏 / 账本裁剪 / waitState …）：以前只在本机手工跑，
+    // 于是 fence-ab / fence-trusted 长期零断言也没人发现。两边都必须挂。
+    { name: '回归脚本(diag)', re: /diag\/\*\.mjs/ },
   ]
   const wf = (rel) => (has(rel) ? read(rel) : null)
   const ciy = wf('.github/workflows/ci.yml')

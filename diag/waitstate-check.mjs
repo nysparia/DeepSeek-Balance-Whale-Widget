@@ -5,6 +5,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { makeExtractor } from './_extract.mjs'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const SRC = fs.readFileSync(path.join(here, '..', 'lib', 'index.js'), 'utf8')
@@ -36,12 +37,8 @@ function braceBlock(at) {
   throw new Error('unbalanced braces')
 }
 
-function extractFn(name) {
-  const at = SRC.indexOf('function ' + name + '(')
-  if (at < 0) throw new Error('function not found: ' + name)
-  // braceBlock 返回的是从 `{` 起的那一段 ⇒ 结束位置 = 花括号起点 + 段长（不是 at + 段长）
-  return SRC.slice(at, SRC.indexOf('{', at) + braceBlock(at).length)
-}
+// 按函数名抽取源码：抽取器在 diag/_extract.mjs（共用；`async function` 不会被截掉 async）。
+const extractFn = makeExtractor(SRC)
 
 // 状态声明（三行）也从源码里取，避免测试里另写一份常量
 function extractDecl(re) {

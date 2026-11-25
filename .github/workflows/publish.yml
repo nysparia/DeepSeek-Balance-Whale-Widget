@@ -111,6 +111,19 @@ jobs:
       - name: Core invariants audit (incl. packed artifact)
         run: node tools/ci-audit.mjs
 
+      # 回归脚本（diag/*.mjs）：与 ci.yml 同一份。每个脚本都从 lib/index.js 里按源码位置抽取
+      # 真实代码再断言（信任栅栏 / 账本裁剪 / waitState 串会话…），退出码非 0 即失败。
+      # 发版前必须再跑一遍：这些是"改了不会报错、只会静默失效"的行为。
+      # `_` 开头的是共享模块（_extract / _baseline），跳过。
+      - name: Regression diags (diag/*.mjs)
+        run: |
+          for f in diag/*.mjs; do
+            case "$(basename "$f")" in _*) continue ;; esac
+            echo "::group::$f"
+            node "$f"
+            echo "::endgroup::"
+          done
+
       # 当前版本是否已发布过（避免重复触发同一版本时发布失败炸掉 workflow）
       - name: Check if version already published
         id: check

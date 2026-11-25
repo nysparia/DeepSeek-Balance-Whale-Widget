@@ -5,11 +5,12 @@
 //
 // 做法与 diag/ 下其它脚本一致：从 lib/index.js **按源码位置抽取真实代码**，
 // 拼进带桩的作用域里跑，断言的是仓库里那份代码本身。
-// 同时从 `git show HEAD:lib/index.js` 抽旧版做 before/after 对照。
+// 同时从 git 历史里抽"修复前"的 lib/index.js 做 before/after 对照。
 import fs from 'node:fs'
 import path from 'node:path'
-import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import { findOldBaseline } from './_baseline.mjs'
+import { makeExtractor } from './_extract.mjs'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const REPO = path.join(here, '..')
@@ -18,19 +19,14 @@ const SRC = fs.readFileSync(path.join(REPO, 'lib', 'index.js'), 'utf8')
 // "旧版"基线：**不能写死 HEAD** —— 修复提交之后 HEAD 里已经是新版，拿它当基线
 // 会让下面的旧版抽取直接失败。这里沿 lib/index.js 的历史往回找，取**最近一个
 // 仍含旧退避代码**的版本（即修复前的上游 0.4.2）。
-function findOldBaseline() {
-  const revs = execFileSync('git', ['rev-list', 'HEAD', '--', 'lib/index.js'], { cwd: REPO, encoding: 'utf8' })
-    .trim().split('\n').filter(Boolean)
-  for (const rev of revs) {
-    const src = execFileSync('git', ['show', rev + ':lib/index.js'], { cwd: REPO, encoding: 'utf8' })
-    // 判据用**代码行**而不是片段：新版注释里也提到了 `20 * (attempt + 1)`，
-    // 用裸片段会把修复后的版本误判成基线。
-    if (src.includes('Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20 * (attempt + 1))')
-      && src.includes('let updateCheckCache = null')) return { rev, src }
-  }
-  throw new Error('找不到修复前的 lib/index.js 基线')
-}
-const baseline = findOldBaseline()
+// 判据用**代码行**而不是片段：新版注释里也提到了 `20 * (attempt + 1)`，
+// 用裸片段会把修复后的版本误判成基线。
+const baseline = findOldBaseline(
+  REPO,
+  (src) => src.includes('Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20 * (attempt + 1))')
+    && src.includes('let updateCheckCache = null'),
+  '仍含旧退避代码的版本',
+)
 const OLD = baseline.src
 console.log('旧版基线：' + baseline.rev.slice(0, 7))
 
@@ -41,32 +37,7 @@ function ok(name, cond, detail) {
 }
 
 // —— 按函数名抽取源码（从 `function NAME(` 到配对的花括号）——
-function extractFn(src, name) {
-  const at = src.indexOf('function ' + name + '(')
-  if (at < 0) throw new Error('function not found: ' + name)
-  const open = src.indexOf('{', at)
-  let depth = 0
-  let inStr = null
-  let inLine = false
-  let inBlock = false
-  for (let i = open; i < src.length; i++) {
-    const c = src[i]
-    const n = src[i + 1]
-    if (inLine) { if (c === '\n') inLine = false; continue }
-    if (inBlock) { if (c === '*' && n === '/') { inBlock = false; i++ } continue }
-    if (inStr) {
-      if (c === '\\') { i++; continue }
-      if (c === inStr) inStr = null
-      continue
-    }
-    if (c === '/' && n === '/') { inLine = true; i++; continue }
-    if (c === '/' && n === '*') { inBlock = true; i++; continue }
-    if (c === '"' || c === "'" || c === '`') { inStr = c; continue }
-    if (c === '{') depth++
-    else if (c === '}') { depth--; if (depth === 0) return src.slice(at, i + 1) }
-  }
-  throw new Error('unbalanced braces in ' + name)
-}
+// 抽取器在 diag/_extract.mjs（共用；`async function` 不会被截掉 async）。
 
 // ===========================================================================
 // Bug A：ledgerIo 重试期间事件循环是否被阻塞
@@ -76,7 +47,7 @@ console.log('\n=== Bug A: ledgerIo 重试期间的事件循环阻塞 ===')
 // 抽取 ledgerIo 及其上方的常量（LEDGER_RETRY_WAIT_MS / LEDGER_RETRY_LIMIT）。
 // 旧版没有常量，直接抽函数体即可。
 function buildLedgerIo(src, label) {
-  const fn = extractFn(src, 'ledgerIo')
+  const fn = makeExtractor(src)('ledgerIo')
   const consts = [...src.matchAll(/const (LEDGER_RETRY_WAIT_MS|LEDGER_RETRY_LIMIT) = (\d+)/g)]
     .map((m) => `const ${m[1]} = ${m[2]};`)
     .join('\n')

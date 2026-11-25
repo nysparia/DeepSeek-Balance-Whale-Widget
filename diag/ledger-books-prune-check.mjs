@@ -6,27 +6,23 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { beijingDay, dayOffset } from '../lib/accounting.mjs'
+import { findOldBaseline } from './_baseline.mjs'
+import { makeExtractor } from './_extract.mjs'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const REPO = path.join(here, '..')
 const SRC = fs.readFileSync(path.join(REPO, 'lib', 'index.js'), 'utf8')
 
 // "旧版"基线：沿 lib/index.js 的历史往回找，取最近一个**仍只清 events/history** 的版本。
-function findOldBaseline() {
-  const revs = execFileSync('git', ['rev-list', 'HEAD', '--', 'lib/index.js'], { cwd: REPO, encoding: 'utf8' })
-    .trim().split('\n').filter(Boolean)
-  for (const rev of revs) {
-    const src = execFileSync('git', ['show', rev + ':lib/index.js'], { cwd: REPO, encoding: 'utf8' })
-    if (src.includes('function pruneLedgerUsage(led)')
-      && !src.includes('bookDaysDropped')
-      && src.includes('ar.history = Object.assign({}, ar.history || {}, dropHist)')) return { rev, src }
-  }
-  throw new Error('找不到修复前的 lib/index.js 基线')
-}
-const baseline = findOldBaseline()
+const baseline = findOldBaseline(
+  REPO,
+  (src) => src.includes('function pruneLedgerUsage(led)')
+    && !src.includes('bookDaysDropped')
+    && src.includes('ar.history = Object.assign({}, ar.history || {}, dropHist)'),
+  '仍只清 events/history 的版本',
+)
 const OLD = baseline.src
 console.log('旧版基线：' + baseline.rev.slice(0, 7))
 
@@ -36,48 +32,21 @@ function ok(name, cond, detail) {
   else { failures++; console.log('  ❌ ' + name + (detail ? '  ' + detail : '')) }
 }
 
-// —— 按函数名抽取源码（从 `function NAME(` 到配对的花括号）——
-function extractFn(src, name) {
-  const at = src.indexOf('function ' + name + '(')
-  if (at < 0) throw new Error('function not found: ' + name)
-  const open = src.indexOf('{', at)
-  let depth = 0
-  let inStr = null
-  let inLine = false
-  let inBlock = false
-  for (let i = open; i < src.length; i++) {
-    const c = src[i]
-    const n = src[i + 1]
-    if (inLine) { if (c === '\n') inLine = false; continue }
-    if (inBlock) { if (c === '*' && n === '/') { inBlock = false; i++ } continue }
-    if (inStr) {
-      if (c === '\\') { i++; continue }
-      if (c === inStr) inStr = null
-      continue
-    }
-    if (c === '/' && n === '/') { inLine = true; i++; continue }
-    if (c === '/' && n === '*') { inBlock = true; i++; continue }
-    if (c === '"' || c === "'" || c === '`') { inStr = c; continue }
-    if (c === '{') depth++
-    else if (c === '}') { depth--; if (depth === 0) return src.slice(at, i + 1) }
-  }
-  throw new Error('unbalanced braces in ' + name)
-}
-
 // 拼一个只含账本保留策略相关函数的沙箱。fs 可注入（用来模拟归档写盘失败）。
 // v8xx：readUsageArchive / pruneLedgerUsage 现在走 ledgerIo（temp+rename 与读重试），
 //   所以沙箱里要一并提供 ledgerIo 与它的两个常量（从源码抽，不另写一份）。
 function buildHarness(src, opts = {}) {
+  const extractFn = makeExtractor(src)
   const consts = [...src.matchAll(/const (LEDGER_RETRY_WAIT_MS|LEDGER_RETRY_LIMIT) = (\d+)/g)]
     .map((m) => `const ${m[1]} = ${m[2]};`)
     .join('\n')
   const code = [
     consts,
-    extractFn(src, 'ledgerIo'),
-    extractFn(src, 'ledgerBackupCorrupt'),
-    extractFn(src, 'usageArchivePath'),
-    extractFn(src, 'readUsageArchive'),
-    extractFn(src, 'pruneLedgerUsage'),
+    extractFn('ledgerIo'),
+    extractFn('ledgerBackupCorrupt'),
+    extractFn('usageArchivePath'),
+    extractFn('readUsageArchive'),
+    extractFn('pruneLedgerUsage'),
   ].join('\n')
   const factory = new Function(
     'fs', 'path', 'DSH_HOME', 'USAGE_FILE_CANDIDATES', 'todayKey', 'dayAdd', 'console',
