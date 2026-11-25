@@ -5,6 +5,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { makeExtractor } from './_extract.mjs'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const SRC = fs.readFileSync(path.join(here, '..', 'assets', 'whale-widget.js'), 'utf8')
@@ -201,6 +202,74 @@ console.log('\n[2] 后台且距上次后台轮询不足 10s → 不发（降频�
   ok(p.st.calls.length === 2, '满 10s 再发', 'calls=' + p.st.calls.length)
 }
 
+console.log('\n[2b] 后台 + 有轮次在跑（busy:true）→ 1 秒就发，不等 10s')
+{
+  const p = buildPoll({
+    hidden: true, now: 1000000,
+    fetch: (url) => Promise.resolve({ json: () => Promise.resolve(url.indexOf('last-turn') >= 0 ? { ok: true, seq: 1, busy: true } : { ok: true }) }),
+  })
+  p.pollLastTurn()
+  await flush()
+  eq(p.st.calls.length, 1, '第一次发')
+  p.st.now += 1000
+  p.pollLastTurn()
+  await flush()
+  eq(p.st.calls.length, 2, '1 秒后再发（busy 生效）')
+}
+
+console.log('\n[2c] 后台 + 有挂起在等（pending）→ 1 秒就发')
+{
+  const p = buildPoll({
+    hidden: true, now: 1000000,
+    fetch: (url) => Promise.resolve({ json: () => Promise.resolve(url.indexOf('wait') >= 0 ? { ok: true, pending: { kind: 'question', id: 'q1' } } : { ok: true }) }),
+  })
+  p.pollWaitState()
+  await flush()
+  eq(p.st.calls.length, 1, '第一次发')
+  p.st.now += 1000
+  p.pollWaitState()
+  await flush()
+  eq(p.st.calls.length, 2, '1 秒后再发（pending 生效）')
+}
+
+console.log('\n[2d] 后台空闲（busy:false、无挂起）→ 仍按 10s 降频')
+{
+  const p = buildPoll({
+    hidden: true, now: 1000000,
+    fetch: (url) => Promise.resolve({ json: () => Promise.resolve(url.indexOf('last-turn') >= 0 ? { ok: true, seq: 1, busy: false } : { ok: true }) }),
+  })
+  p.pollLastTurn()
+  await flush()
+  p.st.now += 5000
+  p.pollLastTurn()
+  await flush()
+  eq(p.st.calls.length, 1, '5 秒内不发（空闲不抢请求）')
+}
+
+console.log('\n[2e] 一轮结束（busy 翻回 false）后，后台回到 10s 降频')
+{
+  let busy = true
+  const p = buildPoll({
+    hidden: true, now: 1000000,
+    fetch: (url) => Promise.resolve({ json: () => Promise.resolve(url.indexOf('last-turn') >= 0 ? { ok: true, seq: 1, busy: busy } : { ok: true }) }),
+  })
+  p.pollLastTurn()
+  await flush()
+  p.st.now += 1000
+  p.pollLastTurn()
+  await flush()
+  eq(p.st.calls.length, 2, 'busy 期间 1 秒一次')
+  busy = false
+  p.st.now += 1000
+  p.pollLastTurn()
+  await flush()
+  eq(p.st.calls.length, 3, '这一轮结束的那次仍发（拿到 busy:false）')
+  p.st.now += 1000
+  p.pollLastTurn()
+  await flush()
+  eq(p.st.calls.length, 3, '之后回到 10s 降频')
+}
+
 console.log('\n[3] 两个 poll 的后台时间戳互不干扰（共用一份会让 wait.json 永远不查）')
 {
   const p = buildPoll({ hidden: true, now: 1000000 })
@@ -383,6 +452,30 @@ console.log('\n[14] 原有失效点保留：invalidateCursorRectSoon 立刻失�
   c.invalidateCursorRectSoon()
   c.invalidateCursorRectSoon()
   eq(c.st.timers.length, before + 1, '定时器已在排时不重复排')
+}
+
+// ===========================================================================
+// 四、宿主侧 busy 信号（last-turn.json 的 busy 字段）
+// ===========================================================================
+console.log('\n[15] 宿主 turnBusy：turn/start 置位、turn/end 清位、多会话互不影响')
+{
+  const HOST_SRC = fs.readFileSync(path.join(here, '..', 'lib', 'index.js'), 'utf8')
+  const extractFn = makeExtractor(HOST_SRC)
+  const decl = HOST_SRC.match(/const turnBusy = new Set\(\)/)[0]
+  const factory = new Function(`${decl}
+${extractFn('noteTurnBusy')}
+${extractFn('turnBusyNow')}
+return { noteTurnBusy, turnBusyNow }`)
+  const h = factory()
+  ok(h.turnBusyNow() === false, '初始空闲')
+  h.noteTurnBusy('s1', 'turn/start')
+  ok(h.turnBusyNow() === true, 'turn/start 后 busy')
+  h.noteTurnBusy('s2', 'turn/start')
+  h.noteTurnBusy('s1', 'turn/end')
+  ok(h.turnBusyNow() === true, '另一个会话还在跑 → 仍 busy')
+  h.noteTurnBusy('s2', 'turn/end')
+  ok(h.turnBusyNow() === false, '全部结束 → 空闲')
+  ok(HOST_SRC.indexOf('busy: turnBusyNow()') >= 0, 'last-turn.json 的响应里带 busy 字段')
 }
 
 console.log('\n' + (fail === 0 ? '全部通过' : '有失败') + `：${pass} 通过 / ${fail} 失败`)

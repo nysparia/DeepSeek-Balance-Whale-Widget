@@ -22463,16 +22463,23 @@ function waitEventCfg(kind) {
 }
 // issue #342：in-flight 守卫。宿主响应慢于 1 秒时，旧实现每秒再发一个 —— 请求会堆叠，
 // 而且每个响应回来都要跑一遍渲染/去重逻辑。同一时刻只允许一个在飞。
-// 后台降频：document.hidden 时**不停**轮询，只把频率压到 10 秒一次。任务结束音 / 提问音 /
-// 授权音只由这两个 poll 触发（全文件没有 Notification API），用户把 DSH 切到后台等 agent
-// 跑完正是最需要提醒的场景，停掉就等于不提醒。前台仍是每秒一次。
+// 后台轮询：document.hidden 时**不停**，按"有没有活"自适应。任务结束音 / 提问音 / 授权音
+// 只由这两个 poll 触发（全文件没有 Notification API），用户把 DSH 切到后台等 agent 跑完
+// 正是最需要提醒的场景，停掉就等于不提醒。前台仍是每秒一次。
+//   · 有轮次在跑（last-turn.json 的 busy）或有挂起在等（wait.json 的 pending）→ 后台也按 1 秒；
+//   · 空闲 → 10 秒一次（浏览器对隐藏标签页本来就会节流到 1/分钟，空闲时没必要抢）。
 // 两个 poll 各记各的后台时间戳：共用一份的话，同一 tick 里先跑的那个会把后一个挡掉，
 // wait.json 在后台就永远不查了。
 var BG_POLL_MS = 10000
 var lastBgPollAt = 0
 var lastBgPollAtTurn = 0
+// 自适应信号：来自上一次响应。切到后台时如果这一轮正在跑，上一次前台轮询（1 秒前）
+// 已经把 busy 带回来了，所以后台立刻就是 1 秒；空闲时最多 10 秒才发现"有活了"。
+var lastTurnBusy = false
+var waitPendingNow = false
 function pollBgAllowed(lastAt) {
   if (!document.hidden) return true
+  if (lastTurnBusy || waitPendingNow) return true
   return Date.now() - lastAt >= BG_POLL_MS
 }
 // in-flight 守卫的看门狗：fetch 挂住时 busy 会永久为 true（之后每个 tick 都被挡掉，
@@ -22509,6 +22516,8 @@ function pollWaitState() {
         if (!d || !d.ok) return
         if (typeof d.sessionName === 'string') waitSessionName = d.sessionName
         var p = d.pending || null
+        // 有挂起在等 → 后台也按 1 秒轮询（用户回来时泡泡要立刻是新的）
+        waitPendingNow = !!(p && p.kind)
         if (!p || !p.kind) {
           // 挂起已解除：收起泡泡，并允许下一次挂起照常响
           waitSeenId = ''
@@ -22568,6 +22577,8 @@ function pollLastTurn() {
       .then(function (r) { return r.json() })
       .then(function (d) {
         if (!d || !d.ok || typeof d.seq !== 'number') return
+        // 有轮次在跑 → 后台也按 1 秒轮询（任务结束音要尽快响）
+        lastTurnBusy = d.busy === true
         if (!lastCostAligned) {
           // 首次拿到数据：以本地记忆的 seq 为基准，只弹比它更新的轮次
           lastCostAligned = true
