@@ -19094,6 +19094,8 @@ function express() {
   state.top = clampWidgetTop(state.top)
   root.style.top = state.top + 'px'
   root.classList.toggle('dshwv-left', !!state.flip)
+  // issue #339：几何变了 ⇒ 光标路径的矩形缓存作废（过渡期间还会再失效一次）
+  try { invalidateCursorRectSoon() } catch (err) {}
 }
 function settle() {
   var vp = viewport()
@@ -21532,6 +21534,11 @@ audioEditReleaseBtn.addEventListener('click', function (e) { e.stopPropagation()
 var hitCanvas = null
 var hitReady = false
 var hitFailed = false // 命中图加载失败（如图片 404/资源缺失）：退回矩形区域判定，绝不吞掉整页事件
+// issue #339：命中图的 alpha 通道整张缓存（610×610 = 372KB）。
+// 旧实现每次 isWhaleHit 都 getImageData(1,1) —— canvas 回读是 GPU→CPU 同步，
+// 而 isWhaleHit 在每次 pointermove 上都会被调用。现在只在命中图建好时读一次整张，
+// 之后查表（hitAlpha[y * 610 + x] > 10），语义与逐点读完全一致。
+var hitAlpha = null
 function setupHitTest(url) {
   try {
     hitCanvas = document.createElement('canvas')
@@ -21539,6 +21546,7 @@ function setupHitTest(url) {
     hitCanvas.height = 610
     hitReady = false
     hitFailed = false
+    hitAlpha = null
     var probe = new Image()
     probe.onload = function () {
       try {
@@ -21553,6 +21561,12 @@ function setupHitTest(url) {
         var dx = 610 - dw // right bottom
         var dy = 610 - dh
         ctx.drawImage(probe, dx, dy, dw, dh)
+        // issue #339：整张读一次（1.5MB 的 ImageData 只活在这一帧），只留 alpha（372KB）。
+        // 读不出来（隐私保护/跨域污染）会抛错 → 落到下面的 catch，与旧行为一致。
+        var full = ctx.getImageData(0, 0, 610, 610).data
+        var alpha = new Uint8Array(610 * 610)
+        for (var ai = 0, aj = 3; ai < alpha.length; ai++, aj += 4) alpha[ai] = full[aj]
+        hitAlpha = alpha
         // v756（issue #144）：画布读回可能被浏览器**抹白** —— Firefox 开启「隐私保护 / resistFingerprinting」
         // 时 getImageData 会返回全透明（有些版本直接抛错）。那样 isWhaleHit 的 `data[3] > 10` 处处为假，
         // 而 hitReady 仍为 true ⇒ 走不到矩形回退分支 ⇒ **整只挂件点不动**。
@@ -21562,10 +21576,10 @@ function setupHitTest(url) {
           for (var gx = 0; gx < 6; gx++) {
             var px = Math.min(609, Math.floor(dx + dw * (gx + 0.5) / 6))
             var py = Math.min(609, Math.floor(dy + dh * (gy + 0.5) / 6))
-            if (ctx.getImageData(px, py, 1, 1).data[3] > 10) opaque++
+            if (alpha[py * 610 + px] > 10) opaque++
           }
         }
-        if (!opaque) { hitReady = false; hitFailed = true; applyHitClip(''); return }
+        if (!opaque) { hitReady = false; hitFailed = true; hitAlpha = null; applyHitClip(''); return }
         hitReady = true
         // v757（issue #147）：命中图可用 → 用不透明区域的凸包裁掉 img 的透明边距，
         // 这样"身体自己接事件"不会把透明角落的点击也吞掉。
@@ -21587,10 +21601,13 @@ function setupHitTest(url) {
 // 退回「图像矩形」判定：命中图不可用（加载失败 / 画布读不出来）时只认挂件图片的矩形区域，
 // 绝不把整页当成命中区（那会让全页面点不动）。
 function whaleRectHit(e) {
+  return whaleRectHitAt(e.clientX, e.clientY)
+}
+function whaleRectHitAt(x, y, cachedRect) {
   try {
-    var fr = img.getBoundingClientRect()
+    var fr = cachedRect || img.getBoundingClientRect()
     if (!fr || fr.width <= 0 || fr.height <= 0) return false
-    return e.clientX >= fr.left && e.clientX <= fr.right && e.clientY >= fr.top && e.clientY <= fr.bottom
+    return x >= fr.left && x <= fr.right && y >= fr.top && y <= fr.bottom
   } catch (err) { return false }
 }
 // —— v757（issue #147）：把命中图的不透明区域做成 clip-path ——
@@ -21623,15 +21640,14 @@ function convexHull(pts) {
 }
 function buildHitClipPath() {
   try {
-    var c = hitCanvas && hitCanvas.getContext ? hitCanvas.getContext('2d') : null
-    if (!c) return ''
-    var data = c.getImageData(0, 0, 610, 610).data // 只读一次（1.5MB），别逐行读
+    if (!hitAlpha) return ''
+    var data = hitAlpha // 整张 alpha 表（见 setupHitTest），不再逐点回读画布
     var pts = []
     for (var y = 0; y < 610; y++) {
       var l = -1, r = -1
-      var base = y * 610 * 4
+      var base = y * 610
       for (var x = 0; x < 610; x++) {
-        if (data[base + x * 4 + 3] > 10) { if (l < 0) l = x; r = x }
+        if (data[base + x] > 10) { if (l < 0) l = x; r = x }
       }
       if (l >= 0) { pts.push([l, y]); pts.push([r, y]) }
     }
@@ -21648,30 +21664,43 @@ function buildHitClipPath() {
   }
 }
 function isWhaleHit(e) {
+  return isWhaleHitAt(e.clientX, e.clientY)
+}
+// issue #339：把「按坐标判定」抽出来，让高频的 pointermove 光标路径可以传入**缓存的矩形**
+// （见 cursorImgRect），避免每次移动都 img.getBoundingClientRect() 强制同步布局。
+// 点击/拖动/click 拦截这些低频且必须精确的路径仍然传 undefined ⇒ 现取现算，行为与旧版一致。
+function isWhaleHitAt(x, y, cachedRect) {
   // 命中图未就绪/失败时：绝不默认“全屏都是鲸鱼”。
   // 加载中 → 返回 false（不拦截页面）；加载失败 → 退回图像矩形区域，仅挂件区域可拖。
   if (!hitCanvas || !hitReady) {
     if (!hitFailed) return false
-    return whaleRectHit(e)
+    return whaleRectHitAt(x, y, cachedRect)
   }
   try {
-    var r = img.getBoundingClientRect()
+    var r = cachedRect || img.getBoundingClientRect()
     if (!r || r.width <= 0 || r.height <= 0) return false
-    var lx = (e.clientX - r.left) / r.width * 610
-    var ly = (e.clientY - r.top) / r.height * 610
+    var lx = (x - r.left) / r.width * 610
+    var ly = (y - r.top) / r.height * 610
     if (lx < 0 || ly < 0 || lx >= 610 || ly >= 610) return false
     if (state.flip) lx = 610 - lx
-    var data
+    var ix = Math.floor(lx)
+    var iy = Math.floor(ly)
+    if (ix < 0) ix = 0
+    if (ix > 609) ix = 609
+    if (iy < 0) iy = 0
+    if (iy > 609) iy = 609
+    if (hitAlpha) return hitAlpha[iy * 610 + ix] > 10
+    // 兜底：alpha 表没建起来（理论上不会发生）→ 退回逐点回读
     try {
-      data = hitCanvas.getContext('2d').getImageData(Math.floor(lx), Math.floor(ly), 1, 1).data
+      var data = hitCanvas.getContext('2d').getImageData(ix, iy, 1, 1).data
+      return data[3] > 10
     } catch (err) {
       // v756（issue #144）：画布读不出来（隐私保护/跨域污染）→ 立刻降级为矩形判定，
       // 并且**记住**这个状态，后续调用直接走矩形，不再每次抛错。
       hitReady = false
       hitFailed = true
-      return whaleRectHit(e)
+      return whaleRectHitAt(x, y, cachedRect)
     }
-    return data[3] > 10
   } catch (err) {
     return false
   }
@@ -21917,6 +21946,32 @@ function onWhaleWheel(e) {
   } catch (err) {}
 }
 try { root.addEventListener('wheel', onWhaleWheel, { passive: false }) } catch (err) {}
+// —— issue #339：pointermove 光标判定的三层降本 ——
+//   ① rAF 节流：pointermove 只记坐标，一帧最多判定一次（1000Hz 回报率鼠标 → 60Hz）；
+//   ② 不再 document.elementFromPoint：事件自带的 e.target 就是同一次命中测试的结果，
+//      拿它做 closest() 判断零成本（elementFromPoint 会强制同步布局）；
+//   ③ 矩形与命中图都缓存：img.getBoundingClientRect() 只在失效后重算，命中图查 alpha 表。
+// 缓存**只用于光标路径**；点击/拖动/click 拦截仍现取现算，避免缓存过期导致"点不动"。
+var cursorRectCache = null
+var cursorRectTimer = 0
+function invalidateCursorRect() { cursorRectCache = null }
+// express() 之后 left/top 有 .16s 过渡，过渡期间矩形在动：立刻失效一次，
+// 再在过渡结束后（transitionend 或 260ms 兜底）失效一次，避免缓存停在过渡起点。
+function invalidateCursorRectSoon() {
+  invalidateCursorRect()
+  if (cursorRectTimer) return
+  cursorRectTimer = setTimeout(function () {
+    cursorRectTimer = 0
+    invalidateCursorRect()
+  }, 260)
+}
+function cursorImgRect() {
+  if (cursorRectCache) return cursorRectCache
+  try { cursorRectCache = img.getBoundingClientRect() } catch (err) { cursorRectCache = null }
+  return cursorRectCache
+}
+var cursorRafId = 0
+var cursorPending = null
 function onDocPointerMoveCursor(e) {
   if (drag && drag.active) {
     // v751（PR #119）：按钮已经松开却还在"拖动中" = 这一次 pointerup 丢了（例如松手时指针在窗口外）：
@@ -21927,20 +21982,54 @@ function onDocPointerMoveCursor(e) {
     setWidgetCursor('grabbing')
     return
   }
-  var el = null
-  try { el = document.elementFromPoint(e.clientX, e.clientY) } catch (err) {}
+  // ① 只记录，判定推迟到下一帧（同一帧内多次移动只算一次）
+  cursorPending = { x: e.clientX, y: e.clientY, target: e.target || null }
+  if (cursorRafId) return
+  try {
+    cursorRafId = requestAnimationFrame(flushCursorMove)
+  } catch (err) {
+    cursorRafId = 0
+    flushCursorMove()
+  }
+}
+function flushCursorMove() {
+  cursorRafId = 0
+  var p = cursorPending
+  cursorPending = null
+  if (!p) return
+  applyCursorMove(p)
+}
+function applyCursorMove(p) {
+  if (drag && drag.active) return
+  // ② 事件自带的 target 就是 elementFromPoint 的答案，且不触发布局。
+  //    只有拿不到 target 的极端情况才退回 elementFromPoint。
+  var el = p.target
+  if (!el) {
+    try { el = document.elementFromPoint(p.x, p.y) } catch (err) { el = null }
+  }
   if (el && el.closest && (el.closest('.dshwv-pop') || el.closest('.dshwv-menu') || el.closest('.dshwv-menu-btn') || el.closest('.dshwv-rolelist') || el.closest('.dshwv-cropmask') || el.closest('.dshwv-confirmmask') || el.closest('.dshwv-audiolist') || el.closest('.dshwv-audiomask') || el.closest('.dshwv-snapmask') || el.closest('.dshwv-bubmask') || el.closest('.dshwv-framemask') || el.closest('.dshwv-qedit') || el.closest('.dshwv-usagepanel') || el.closest('.dshwv-usage-mask') || el.closest('.dshwv-resmask') || el.closest('.dshwv-custmenu') || el.closest('.dshwv-custbtn'))) {
     setWidgetCursor('')
     if (!menuBtnHide) menuBtn.classList.add('dshwv-menu-btn-visible')
     return
   }
-  var over = isWhaleHit(e)
+  // ③ 矩形粗判：指针在挂件矩形之外时连命中图都不查（也不碰任何 DOM 几何）
+  var r = cursorImgRect()
+  var over = false
+  if (r && r.width > 0 && r.height > 0 &&
+      p.x >= r.left && p.x <= r.right && p.y >= r.top && p.y <= r.bottom) {
+    over = isWhaleHitAt(p.x, p.y, r)
+  }
   setWidgetCursor(over ? 'grab' : '')
   // 触屏上必须把 dshwvTouchUI() 也当作"该显示"：拖动鲸鱼时 pointermove 的 over 为 false，
   // 否则这一次 toggle 会把常显状态撤掉（issue #91 缺陷2 修完又被自己抹掉）。
   if (!menuBtnHide) menuBtn.classList.toggle('dshwv-menu-btn-visible', over || menuOpen || dshwvTouchUI())
 }
 document.addEventListener('pointermove', onDocPointerMoveCursor, true)
+// 矩形缓存的失效点：窗口尺寸/滚动、图片加载完成、过渡结束（left/top 有 .16s 过渡）。
+try { window.addEventListener('resize', invalidateCursorRect, { passive: true }) } catch (err) {}
+try { window.addEventListener('scroll', invalidateCursorRect, { capture: true, passive: true }) } catch (err) {}
+try { img.addEventListener('load', invalidateCursorRect) } catch (err) {}
+try { root.addEventListener('transitionend', invalidateCursorRect) } catch (err) {}
 // 启动即应用一次菜单按钮可见性：触屏上 ☰ 常显（issue #91 缺陷2）。
 // 配置读回来之后还会再应用一次，这里是配置请求失败时的兜底。
 try { applyMenuBtnHideUI() } catch (err) {}
@@ -21953,6 +22042,8 @@ function endDrag(e, clickAllowed, cancelled) {
   document.removeEventListener('pointercancel', onDocPointerCancel, true)
   pressUp()
   root.classList.remove('dshwv-dragging')
+  // issue #339：拖动期间挂件一直在动，光标路径的矩形缓存必须作废
+  try { invalidateCursorRect() } catch (err) {}
   // issue #79 缺陷2：pointercancel（Android 把手势判成页面滚动、或系统抢走手势时派发）的
   // clientX/clientY 常常是 0，而 endDrag 又是「按坐标收尾 + saveConfig() 落盘」——
   // 于是位移被算成"一口气拖到了 (0,0)"，归边判定吃进左上角，损坏锚点被写进 localStorage。
@@ -22229,7 +22320,16 @@ var waitSeenId = ''
 function waitEventCfg(kind) {
   try { return ((usageSet || {}).events || {})[kind] || {} } catch (err) { return {} }
 }
+// issue #342：in-flight 守卫。宿主响应慢于 1 秒时，旧实现每秒再发一个 —— 请求会堆叠，
+// 而且每个响应回来都要跑一遍渲染/去重逻辑。同一时刻只允许一个在飞。
+var pollWaitBusy = false
 function pollWaitState() {
+  if (pollWaitBusy) return
+  // 页面在后台不轮询：浏览器会把定时器节流到 1/分钟，但前台可见时是实打实的 2 req/s。
+  // 回到前台由 visibilitychange 立刻补一次（见文件末尾）。
+  if (document.hidden) return
+  pollWaitBusy = true
+  var done = function () { pollWaitBusy = false }
   try {
     fetch(WAIT_URL, { cache: 'no-store' })
       .then(function (r) { return r.json() })
@@ -22275,10 +22375,15 @@ function pollWaitState() {
         // 任务结束音的播放判定不在这里，仍读既有的 usageSet.taskEnd.on（见 playTaskEndSound）。
         if (on && sel && ev.soundOn !== false) playBindingSound({ on: true, sel: sel }, ev)
       })
-      .catch(function () {})
-  } catch (err) {}
+      .then(done, done)
+  } catch (err) { done() }
 }
+var pollLastTurnBusy = false
 function pollLastTurn() {
+  if (pollLastTurnBusy) return
+  if (document.hidden) return
+  pollLastTurnBusy = true
+  var done = function () { pollLastTurnBusy = false }
   try {
     fetch(LAST_TURN_URL, { cache: 'no-store' })
       .then(function (r) { return r.json() })
@@ -22310,10 +22415,21 @@ function pollLastTurn() {
           }
         }
       })
-      .catch(function () {})
-  } catch (err) {}
+      .then(done, done)
+  } catch (err) { done() }
 }
 setInterval(function () { pollLastTurn(); pollWaitState() }, 1000)
+// issue #342：页面回到前台立刻补一次（后台期间被跳过的轮询不补，避免切回来瞬间打一串请求）。
+// 两个 poll 各自有 in-flight 守卫，这里连调两次也不会并发。
+try {
+  document.addEventListener('visibilitychange', function () {
+    try {
+      if (document.hidden) return
+      pollLastTurn()
+      pollWaitState()
+    } catch (err) {}
+  })
+} catch (err) {}
 }
 // 主界面检测通过（或稍后由 MutationObserver 检测到）后执行挂件初始化；非主界面不启动
 try { dshwTryStart(true) } catch (err) {}
